@@ -103,6 +103,69 @@ async function pLimit<T, R>(limit: number, items: T[], fn: (item: T) => Promise<
 
 import { runInPool } from './worker-pool';
 
+// In-memory cache for FileStats to avoid redundant parsing
+interface CacheEntry {
+  stats: FileStats;
+  mtime: number;
+}
+const fileStatsCache = new Map<string, CacheEntry>();
+
+async function getFileStatsCached(filePath: string): Promise<FileStats> {
+  const mtime = fs.statSync(filePath).mtimeMs;
+  const cached = fileStatsCache.get(filePath);
+  if (cached && cached.mtime === mtime) {
+    return cached.stats;
+  }
+  
+  const stats = await parseFileStats(filePath);
+  fileStatsCache.set(filePath, { stats, mtime });
+  return stats;
+}
+
+async function getBatchFileStatsCached(filePaths: string[]): Promise<FileStats[]> {
+  const needsParsing: string[] = [];
+  const results: (FileStats | null)[] = new Array(filePaths.length).fill(null);
+  
+  // Check cache first
+  for (let i = 0; i < filePaths.length; i++) {
+    const filePath = filePaths[i];
+    try {
+      const mtime = fs.statSync(filePath).mtimeMs;
+      const cached = fileStatsCache.get(filePath);
+      if (cached && cached.mtime === mtime) {
+        results[i] = cached.stats;
+      } else {
+        needsParsing.push(filePath);
+      }
+    } catch {
+      // If file doesn't exist or other error, mark for parsing (which will handle error)
+      needsParsing.push(filePath);
+    }
+  }
+
+  // Parse files not in cache using the pool
+  if (needsParsing.length > 0) {
+    const parsedStats = await runInPool(needsParsing);
+    
+    // Merge back into results and update cache
+    let parsedIdx = 0;
+    for (let i = 0; i < filePaths.length; i++) {
+      if (results[i] === null) {
+        const stats = parsedStats[parsedIdx++];
+        results[i] = stats;
+        if (stats && !('error' in stats)) {
+          try {
+            const mtime = fs.statSync(filePaths[i]).mtimeMs;
+            fileStatsCache.set(filePaths[i], { stats, mtime });
+          } catch { /* ignore */ }
+        }
+      }
+    }
+  }
+
+  return results.filter(Boolean) as FileStats[];
+}
+
 export async function getProjects(): Promise<ProjectInfo[]> {
   const projectsDir = getProjectsDir();
   if (!fs.existsSync(projectsDir)) return [];
@@ -123,8 +186,8 @@ export async function getProjects(): Promise<ProjectInfo[]> {
     }
   }
 
-  // Parse ALL files across ALL projects in one big pool run
-  const allStats = await runInPool(allFiles.map(f => f.filePath));
+  // Parse ALL files across ALL projects in one big pool run (using cache where possible)
+  const allStats = await getBatchFileStatsCached(allFiles.map(f => f.filePath));
   
   // Group stats back by project
   const statsByProject: Record<string, typeof allStats> = {};
@@ -195,7 +258,7 @@ export async function getProjectSessions(projectId: string, sort: SessionSortMod
   const jsonlFiles = fs.readdirSync(projectPath).filter(f => f.endsWith('.jsonl'));
   const filePaths = jsonlFiles.map(file => path.join(projectPath, file));
   
-  const allStats = await runInPool(filePaths);
+  const allStats = await getBatchFileStatsCached(filePaths);
   
   const sessions = allStats
     .map(stats => statsToFileSession(stats, projectId, projectName))
@@ -221,8 +284,8 @@ export async function getProjectSessions(projectId: string, sort: SessionSortMod
 export type SessionSortMode = 'timestamp' | 'cost' | 'messages' | 'tokens' | 'duration';
 
 export interface SessionFilters {
-  projectId?: string;
-  model?: string;
+  projectIds?: string[];
+  models?: string[];
   dateRange?: 'w' | 'm' | 'q' | 'y' | 'all';
 }
 
@@ -238,8 +301,8 @@ export async function getSessions(
 
   const allFiles: { filePath: string; projectId: string; projectName: string }[] = [];
   for (const entry of projectEntries) {
-    // If projectId filter is set, skip other projects
-    if (filters?.projectId && entry !== filters.projectId) continue;
+    // If projectIds filter is set, skip projects not in the list
+    if (filters?.projectIds && filters.projectIds.length > 0 && !filters.projectIds.includes('all') && !filters.projectIds.includes(entry)) continue;
 
     const projectPath = path.join(projectsDir, entry);
     if (!fs.statSync(projectPath).isDirectory()) continue;
@@ -251,8 +314,8 @@ export async function getSessions(
     }
   }
 
-  // Parse ALL files across ALL projects
-  const allStats = await runInPool(allFiles.map(f => f.filePath));
+  // Parse ALL files across ALL projects (using cache where possible)
+  const allStats = await getBatchFileStatsCached(allFiles.map(f => f.filePath));
   
   let allSessions = allStats
     .map((stats, i) => statsToFileSession(stats, allFiles[i].projectId, allFiles[i].projectName))
@@ -260,8 +323,10 @@ export async function getSessions(
 
   // Apply filters
   if (filters) {
-    if (filters.model && filters.model !== 'all') {
-      allSessions = allSessions.filter(s => s.models.includes(filters.model!) || s.model === filters.model);
+    if (filters.models && filters.models.length > 0 && !filters.models.includes('all')) {
+      allSessions = allSessions.filter(s => {
+        return s.models.some(m => filters.models!.includes(m)) || filters.models!.includes(s.model);
+      });
     }
     if (filters.dateRange && filters.dateRange !== 'all') {
       const now = new Date();

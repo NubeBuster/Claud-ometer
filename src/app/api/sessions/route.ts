@@ -12,9 +12,9 @@ export async function GET(request: Request) {
     const offset = parseInt(searchParams.get('offset') || '0');
     const sort = (searchParams.get('sort') || 'timestamp') as SessionSortMode;
 
-    const filters = {
-      projectId: searchParams.get('projectId') || undefined,
-      model: searchParams.get('model') || undefined,
+    const filters: SessionFilters = {
+      projectIds: searchParams.get('projectId')?.split(',').filter(Boolean) || undefined,
+      models: searchParams.get('model')?.split(',').filter(Boolean) || undefined,
       dateRange: (searchParams.get('dateRange') || 'all') as SessionFilters['dateRange'],
     };
 
