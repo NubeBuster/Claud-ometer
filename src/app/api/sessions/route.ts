@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { getSessions, getProjectSessions, searchSessions } from '@/lib/claude-data/reader';
+import { getSessions, getProjectSessions, searchSessions, type SessionSortMode } from '@/lib/claude-data/reader';
 
 export const dynamic = 'force-dynamic';
 
@@ -10,6 +10,7 @@ export async function GET(request: Request) {
     const query = searchParams.get('q');
     const limit = parseInt(searchParams.get('limit') || '50');
     const offset = parseInt(searchParams.get('offset') || '0');
+    const sort = (searchParams.get('sort') || 'timestamp') as SessionSortMode;
 
     if (query) {
       const sessions = await searchSessions(query, limit);
@@ -17,11 +18,11 @@ export async function GET(request: Request) {
     }
 
     if (projectId) {
-      const sessions = await getProjectSessions(projectId);
+      const sessions = await getProjectSessions(projectId, sort);
       return NextResponse.json(sessions);
     }
 
-    const sessions = await getSessions(limit, offset);
+    const sessions = await getSessions(limit, offset, sort);
     return NextResponse.json(sessions);
   } catch (error) {
     console.error('Error fetching sessions:', error);

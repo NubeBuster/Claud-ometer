@@ -1,18 +1,20 @@
 'use client';
 
-import { use } from 'react';
+import { use, useState } from 'react';
 import { useProjectSessions } from '@/lib/hooks';
 import { useCostMode } from '@/lib/cost-mode-context';
 import { formatTokens, formatCost, formatDuration, timeAgo } from '@/lib/format';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { ArrowLeft, Clock, GitBranch, MessageSquare, Wrench } from 'lucide-react';
+import { ArrowLeft, Clock, GitBranch, MessageSquare, Wrench, ArrowUpDown } from 'lucide-react';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import Link from 'next/link';
 
 export default function ProjectDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const projectId = decodeURIComponent(id);
-  const { data: sessions, isLoading } = useProjectSessions(projectId);
+  const [sort, setSort] = useState('timestamp');
+  const { data: sessions, isLoading } = useProjectSessions(projectId, sort);
   const { pickCost } = useCostMode();
 
   const projectName = projectId.split('-').pop() || projectId;
@@ -108,8 +110,26 @@ export default function ProjectDetailPage({ params }: { params: Promise<{ id: st
       )}
 
       <Card className="border-border/50 shadow-sm">
-        <CardHeader className="pb-3">
+        <CardHeader className="pb-3 flex flex-row items-center justify-between space-y-0">
           <CardTitle className="text-sm font-semibold">Sessions</CardTitle>
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] font-medium text-muted-foreground flex items-center gap-1">
+              <ArrowUpDown className="h-3 w-3" />
+              Sort
+            </span>
+            <Select value={sort} onValueChange={setSort}>
+              <SelectTrigger className="h-7 w-[120px] text-[10px]">
+                <SelectValue placeholder="Sort" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="timestamp">Newest</SelectItem>
+                <SelectItem value="cost">Cost</SelectItem>
+                <SelectItem value="messages">Messages</SelectItem>
+                <SelectItem value="tokens">Tokens</SelectItem>
+                <SelectItem value="duration">Duration</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
         </CardHeader>
         <CardContent className="pt-0">
           <div className="space-y-2">

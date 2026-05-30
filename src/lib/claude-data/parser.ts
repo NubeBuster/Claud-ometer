@@ -31,6 +31,7 @@ export interface FileStats {
   sessionId: string;
   firstTimestamp: string;
   lastTimestamp: string;
+  mtime: string;
   userMessageCount: number;
   assistantMessageCount: number;
   toolCallCount: number;
@@ -52,11 +53,18 @@ export interface FileStats {
 
 export async function parseFileStats(filePath: string): Promise<FileStats> {
   const sessionId = filePath.split('/').pop()?.replace('.jsonl', '') || '';
+  let mtime = '';
+  try {
+    mtime = fs.statSync(filePath).mtime.toISOString();
+  } catch {
+    mtime = new Date().toISOString();
+  }
 
   const stats: FileStats = {
     sessionId,
     firstTimestamp: '',
     lastTimestamp: '',
+    mtime,
     userMessageCount: 0,
     assistantMessageCount: 0,
     toolCallCount: 0,
@@ -79,9 +87,10 @@ export async function parseFileStats(filePath: string): Promise<FileStats> {
   const modelsSet = new Set<string>();
 
   await forEachJsonlLine(filePath, (msg) => {
-    if (msg.timestamp) {
-      if (!stats.firstTimestamp) stats.firstTimestamp = msg.timestamp;
-      stats.lastTimestamp = msg.timestamp;
+    const ts = msg.timestamp || (msg as any).snapshot?.timestamp;
+    if (ts) {
+      if (!stats.firstTimestamp) stats.firstTimestamp = ts;
+      stats.lastTimestamp = ts;
     }
     if (msg.gitBranch && !stats.gitBranch) stats.gitBranch = msg.gitBranch;
     if (msg.cwd && !stats.cwd) stats.cwd = msg.cwd;

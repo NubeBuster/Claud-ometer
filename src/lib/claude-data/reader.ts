@@ -187,7 +187,7 @@ export async function getProjects(): Promise<ProjectInfo[]> {
   return projects.sort((a, b) => b.lastActive.localeCompare(a.lastActive));
 }
 
-export async function getProjectSessions(projectId: string): Promise<SessionInfo[]> {
+export async function getProjectSessions(projectId: string, sort: SessionSortMode = 'timestamp'): Promise<SessionInfo[]> {
   const projectPath = path.join(getProjectsDir(), projectId);
   if (!fs.existsSync(projectPath)) return [];
 
@@ -197,11 +197,30 @@ export async function getProjectSessions(projectId: string): Promise<SessionInfo
   
   const allStats = await runInPool(filePaths);
   
-  const sessions = allStats.map(stats => statsToFileSession(stats, projectId, projectName));
-  return sessions.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+  const sessions = allStats
+    .map(stats => statsToFileSession(stats, projectId, projectName))
+    .filter(s => s.messageCount > 0);
+
+  return sessions.sort((a, b) => {
+    switch (sort) {
+      case 'cost':
+        return b.estimatedCost - a.estimatedCost;
+      case 'messages':
+        return b.messageCount - a.messageCount;
+      case 'tokens':
+        return (b.totalInputTokens + b.totalOutputTokens) - (a.totalInputTokens + a.totalOutputTokens);
+      case 'duration':
+        return b.duration - a.duration;
+      case 'timestamp':
+      default:
+        return b.timestamp.localeCompare(a.timestamp);
+    }
+  });
 }
 
-export async function getSessions(limit = 50, offset = 0): Promise<SessionInfo[]> {
+export type SessionSortMode = 'timestamp' | 'cost' | 'messages' | 'tokens' | 'duration';
+
+export async function getSessions(limit = 50, offset = 0, sort: SessionSortMode = 'timestamp'): Promise<SessionInfo[]> {
   const projectsDir = getProjectsDir();
   if (!fs.existsSync(projectsDir)) return [];
   const projectEntries = fs.readdirSync(projectsDir);
@@ -221,11 +240,25 @@ export async function getSessions(limit = 50, offset = 0): Promise<SessionInfo[]
   // Parse ALL files across ALL projects
   const allStats = await runInPool(allFiles.map(f => f.filePath));
   
-  const allSessions = allStats.map((stats, i) => 
-    statsToFileSession(stats, allFiles[i].projectId, allFiles[i].projectName)
-  );
+  const allSessions = allStats
+    .map((stats, i) => statsToFileSession(stats, allFiles[i].projectId, allFiles[i].projectName))
+    .filter(s => s.messageCount > 0);
 
-  allSessions.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+  allSessions.sort((a, b) => {
+    switch (sort) {
+      case 'cost':
+        return b.estimatedCost - a.estimatedCost;
+      case 'messages':
+        return b.messageCount - a.messageCount;
+      case 'tokens':
+        return (b.totalInputTokens + b.totalOutputTokens) - (a.totalInputTokens + a.totalOutputTokens);
+      case 'duration':
+        return b.duration - a.duration;
+      case 'timestamp':
+      default:
+        return b.timestamp.localeCompare(a.timestamp);
+    }
+  });
   return allSessions.slice(offset, offset + limit);
 }
 
@@ -238,7 +271,7 @@ function statsToFileSession(stats: FileStats, projectId: string, projectName: st
     id: stats.sessionId,
     projectId,
     projectName,
-    timestamp: stats.firstTimestamp || new Date().toISOString(),
+    timestamp: stats.firstTimestamp || stats.mtime || new Date().toISOString(),
     duration,
     messageCount: stats.userMessageCount + stats.assistantMessageCount,
     userMessageCount: stats.userMessageCount,
@@ -434,7 +467,10 @@ export async function searchSessions(query: string, limit = 50): Promise<Session
 
         if (hasMatch) {
           const { name: projectName } = getProjectNameFromDir(projectPath, entry);
-          matchingSessions.push(await parseSessionFile(filePath, entry, projectName));
+          const session = await parseSessionFile(filePath, entry, projectName);
+          if (session.messageCount > 0) {
+            matchingSessions.push(session);
+          }
         }
       })());
     }

@@ -36,10 +36,18 @@ function calculateCostAllModes(model, input, output, cacheWrite, cacheRead) {
 
 async function parseFileStats(filePath) {
   const sessionId = filePath.split('/').pop().replace('.jsonl', '');
+  let mtime = '';
+  try {
+    mtime = fs.statSync(filePath).mtime.toISOString();
+  } catch {
+    mtime = new Date().toISOString();
+  }
+
   const stats = {
     sessionId,
     firstTimestamp: '',
     lastTimestamp: '',
+    mtime,
     userMessageCount: 0,
     assistantMessageCount: 0,
     toolCallCount: 0,
@@ -67,9 +75,10 @@ async function parseFileStats(filePath) {
     if (!line.trim()) continue;
     try {
       const msg = JSON.parse(line);
-      if (msg.timestamp) {
-        if (!stats.firstTimestamp) stats.firstTimestamp = msg.timestamp;
-        stats.lastTimestamp = msg.timestamp;
+      const ts = msg.timestamp || msg.snapshot?.timestamp;
+      if (ts) {
+        if (!stats.firstTimestamp) stats.firstTimestamp = ts;
+        stats.lastTimestamp = ts;
       }
       if (msg.gitBranch && !stats.gitBranch) stats.gitBranch = msg.gitBranch;
       if (msg.cwd && !stats.cwd) stats.cwd = msg.cwd;

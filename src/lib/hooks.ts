@@ -14,15 +14,15 @@ export function useProjects() {
   return useSWR<ProjectInfo[]>('/api/projects', fetcher);
 }
 
-export function useSessions(limit = 50, offset = 0, query = '') {
+export function useSessions(limit = 50, offset = 0, query = '', sort = 'timestamp') {
   const url = query
     ? `/api/sessions?q=${encodeURIComponent(query)}&limit=${limit}`
-    : `/api/sessions?limit=${limit}&offset=${offset}`;
+    : `/api/sessions?limit=${limit}&offset=${offset}&sort=${sort}`;
   return useSWR<SessionInfo[]>(url, fetcher);
 }
 
-export function useProjectSessions(projectId: string) {
-  return useSWR<SessionInfo[]>(`/api/sessions?projectId=${projectId}`, fetcher);
+export function useProjectSessions(projectId: string, sort = 'timestamp') {
+  return useSWR<SessionInfo[]>(`/api/sessions?projectId=${projectId}&sort=${sort}`, fetcher);
 }
 
 export function useSessionDetail(sessionId: string) {

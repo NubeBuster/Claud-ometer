@@ -7,7 +7,8 @@ import { useCostMode } from '@/lib/cost-mode-context';
 import { formatCost, formatDuration, timeAgo, formatTokens } from '@/lib/format';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { Clock, GitBranch, MessageSquare, FolderKanban, Minimize2, Search, X } from 'lucide-react';
+import { Clock, GitBranch, MessageSquare, FolderKanban, Minimize2, Search, X, ArrowUpDown } from 'lucide-react';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import Link from 'next/link';
 
 function useDebounce(value: string, delay: number) {
@@ -38,11 +39,12 @@ function SessionsContent() {
   const searchParams = useSearchParams();
   const router = useRouter();
   const [searchQuery, setSearchQuery] = useState(searchParams.get('q') || '');
+  const [sort, setSort] = useState(searchParams.get('sort') || 'timestamp');
   const debouncedQuery = useDebounce(searchQuery, 300);
-  const { data: sessions, isLoading } = useSessions(100, 0, debouncedQuery);
+  const { data: sessions, isLoading } = useSessions(100, 0, debouncedQuery, sort);
   const { pickCost } = useCostMode();
 
-  // Sync debounced query to URL
+  // Sync debounced query and sort to URL
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     if (debouncedQuery) {
@@ -50,9 +52,14 @@ function SessionsContent() {
     } else {
       params.delete('q');
     }
+    if (sort !== 'timestamp') {
+      params.set('sort', sort);
+    } else {
+      params.delete('sort');
+    }
     const qs = params.toString();
     router.replace(qs ? `/sessions?${qs}` : '/sessions', { scroll: false });
-  }, [debouncedQuery, router]);
+  }, [debouncedQuery, sort, router]);
 
   if (isLoading || !sessions) {
     return (
@@ -67,7 +74,7 @@ function SessionsContent() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="text-xl font-bold tracking-tight">Sessions</h1>
           <p className="text-sm text-muted-foreground">
@@ -75,6 +82,27 @@ function SessionsContent() {
             {debouncedQuery && ` matching "${debouncedQuery}"`}
           </p>
         </div>
+        
+        {!debouncedQuery && (
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-medium text-muted-foreground flex items-center gap-1">
+              <ArrowUpDown className="h-3 w-3" />
+              Sort by
+            </span>
+            <Select value={sort} onValueChange={setSort}>
+              <SelectTrigger className="h-9 w-[140px] text-xs">
+                <SelectValue placeholder="Sort by" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="timestamp">Newest</SelectItem>
+                <SelectItem value="cost">Highest Cost</SelectItem>
+                <SelectItem value="messages">Message Count</SelectItem>
+                <SelectItem value="tokens">Token Usage</SelectItem>
+                <SelectItem value="duration">Duration</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+        )}
       </div>
 
       <div className="relative">
