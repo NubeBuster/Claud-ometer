@@ -1,13 +1,13 @@
 'use client';
 
-import { useState, useEffect, Suspense } from 'react';
+import { useState, useEffect, useMemo, Suspense } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
-import { useSessions } from '@/lib/hooks';
+import { useSessions, useProjects } from '@/lib/hooks';
 import { useCostMode } from '@/lib/cost-mode-context';
 import { formatCost, formatDuration, timeAgo, formatTokens } from '@/lib/format';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { Clock, GitBranch, MessageSquare, FolderKanban, Minimize2, Search, X, ArrowUpDown } from 'lucide-react';
+import { Clock, GitBranch, MessageSquare, FolderKanban, Minimize2, Search, X, ArrowUpDown, Filter } from 'lucide-react';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import Link from 'next/link';
 
@@ -40,26 +40,40 @@ function SessionsContent() {
   const router = useRouter();
   const [searchQuery, setSearchQuery] = useState(searchParams.get('q') || '');
   const [sort, setSort] = useState(searchParams.get('sort') || 'timestamp');
+  const [projectId, setProjectId] = useState(searchParams.get('projectId') || 'all');
+  const [model, setModel] = useState(searchParams.get('model') || 'all');
+  const [dateRange, setDateRange] = useState(searchParams.get('dateRange') || 'all');
+  
   const debouncedQuery = useDebounce(searchQuery, 300);
-  const { data: sessions, isLoading } = useSessions(100, 0, debouncedQuery, sort);
+  
+  const { data: projects } = useProjects();
+  const { data: sessions, isLoading } = useSessions(100, 0, debouncedQuery, sort, {
+    projectId: projectId === 'all' ? undefined : projectId,
+    model: model === 'all' ? undefined : model,
+    dateRange: dateRange,
+  });
   const { pickCost } = useCostMode();
 
-  // Sync debounced query and sort to URL
+  // Sync state to URL
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    if (debouncedQuery) {
-      params.set('q', debouncedQuery);
-    } else {
-      params.delete('q');
-    }
-    if (sort !== 'timestamp') {
-      params.set('sort', sort);
-    } else {
-      params.delete('sort');
-    }
+    if (debouncedQuery) params.set('q', debouncedQuery); else params.delete('q');
+    if (sort !== 'timestamp') params.set('sort', sort); else params.delete('sort');
+    if (projectId !== 'all') params.set('projectId', projectId); else params.delete('projectId');
+    if (model !== 'all') params.set('model', model); else params.delete('model');
+    if (dateRange !== 'all') params.set('dateRange', dateRange); else params.delete('dateRange');
+    
     const qs = params.toString();
     router.replace(qs ? `/sessions?${qs}` : '/sessions', { scroll: false });
-  }, [debouncedQuery, sort, router]);
+  }, [debouncedQuery, sort, projectId, model, dateRange, router]);
+
+  // Extract unique models from projects if available
+  const allModels = useMemo(() => {
+    if (!projects) return [];
+    const models = new Set<string>();
+    projects.forEach(p => p.models.forEach(m => models.add(m)));
+    return Array.from(models).sort();
+  }, [projects]);
 
   if (isLoading || !sessions) {
     return (
@@ -74,7 +88,7 @@ function SessionsContent() {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
         <div>
           <h1 className="text-xl font-bold tracking-tight">Sessions</h1>
           <p className="text-sm text-muted-foreground">
@@ -84,23 +98,88 @@ function SessionsContent() {
         </div>
         
         {!debouncedQuery && (
-          <div className="flex items-center gap-2">
-            <span className="text-xs font-medium text-muted-foreground flex items-center gap-1">
-              <ArrowUpDown className="h-3 w-3" />
-              Sort by
-            </span>
-            <Select value={sort} onValueChange={setSort}>
-              <SelectTrigger className="h-9 w-[140px] text-xs">
-                <SelectValue placeholder="Sort by" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="timestamp">Newest</SelectItem>
-                <SelectItem value="cost">Highest Cost</SelectItem>
-                <SelectItem value="messages">Message Count</SelectItem>
-                <SelectItem value="tokens">Token Usage</SelectItem>
-                <SelectItem value="duration">Duration</SelectItem>
-              </SelectContent>
-            </Select>
+          <div className="flex flex-wrap items-center gap-3">
+            {/* Sort */}
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground/70">Sort</span>
+              <Select value={sort} onValueChange={setSort}>
+                <SelectTrigger className="h-8 w-[120px] text-xs bg-card">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="timestamp">Newest</SelectItem>
+                  <SelectItem value="cost">Highest Cost</SelectItem>
+                  <SelectItem value="messages">Messages</SelectItem>
+                  <SelectItem value="tokens">Tokens</SelectItem>
+                  <SelectItem value="duration">Duration</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="h-4 w-px bg-border/60 mx-1 hidden sm:block" />
+
+            {/* Project Filter */}
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground/70">Project</span>
+              <Select value={projectId} onValueChange={setProjectId}>
+                <SelectTrigger className="h-8 w-[140px] text-xs bg-card">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All Projects</SelectItem>
+                  {projects?.map(p => (
+                    <SelectItem key={p.id} value={p.id}>{p.name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+
+            {/* Model Filter */}
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground/70">Model</span>
+              <Select value={model} onValueChange={setModel}>
+                <SelectTrigger className="h-8 w-[130px] text-xs bg-card">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All Models</SelectItem>
+                  {allModels.map(m => (
+                    <SelectItem key={m} value={m}>{m}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+
+            {/* Date Filter */}
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground/70">Range</span>
+              <Select value={dateRange} onValueChange={setDateRange}>
+                <SelectTrigger className="h-8 w-[110px] text-xs bg-card">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All Time</SelectItem>
+                  <SelectItem value="w">Last Week</SelectItem>
+                  <SelectItem value="m">Last Month</SelectItem>
+                  <SelectItem value="q">Last Quarter</SelectItem>
+                  <SelectItem value="y">Last Year</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            
+            {(projectId !== 'all' || model !== 'all' || dateRange !== 'all') && (
+              <button
+                onClick={() => {
+                  setProjectId('all');
+                  setModel('all');
+                  setDateRange('all');
+                }}
+                className="flex items-center gap-1 text-[10px] font-medium text-primary hover:text-primary/80 transition-colors ml-1"
+              >
+                <X className="h-3 w-3" />
+                Clear
+              </button>
+            )}
           </div>
         )}
       </div>

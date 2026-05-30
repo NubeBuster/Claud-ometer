@@ -12,17 +12,18 @@ export async function GET(request: Request) {
     const offset = parseInt(searchParams.get('offset') || '0');
     const sort = (searchParams.get('sort') || 'timestamp') as SessionSortMode;
 
+    const filters = {
+      projectId: searchParams.get('projectId') || undefined,
+      model: searchParams.get('model') || undefined,
+      dateRange: (searchParams.get('dateRange') || 'all') as SessionFilters['dateRange'],
+    };
+
     if (query) {
       const sessions = await searchSessions(query, limit);
       return NextResponse.json(sessions);
     }
 
-    if (projectId) {
-      const sessions = await getProjectSessions(projectId, sort);
-      return NextResponse.json(sessions);
-    }
-
-    const sessions = await getSessions(limit, offset, sort);
+    const sessions = await getSessions(limit, offset, sort, filters);
     return NextResponse.json(sessions);
   } catch (error) {
     console.error('Error fetching sessions:', error);

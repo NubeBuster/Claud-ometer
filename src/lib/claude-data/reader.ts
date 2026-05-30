@@ -220,13 +220,27 @@ export async function getProjectSessions(projectId: string, sort: SessionSortMod
 
 export type SessionSortMode = 'timestamp' | 'cost' | 'messages' | 'tokens' | 'duration';
 
-export async function getSessions(limit = 50, offset = 0, sort: SessionSortMode = 'timestamp'): Promise<SessionInfo[]> {
+export interface SessionFilters {
+  projectId?: string;
+  model?: string;
+  dateRange?: 'w' | 'm' | 'q' | 'y' | 'all';
+}
+
+export async function getSessions(
+  limit = 50, 
+  offset = 0, 
+  sort: SessionSortMode = 'timestamp',
+  filters?: SessionFilters
+): Promise<SessionInfo[]> {
   const projectsDir = getProjectsDir();
   if (!fs.existsSync(projectsDir)) return [];
   const projectEntries = fs.readdirSync(projectsDir);
 
   const allFiles: { filePath: string; projectId: string; projectName: string }[] = [];
   for (const entry of projectEntries) {
+    // If projectId filter is set, skip other projects
+    if (filters?.projectId && entry !== filters.projectId) continue;
+
     const projectPath = path.join(projectsDir, entry);
     if (!fs.statSync(projectPath).isDirectory()) continue;
 
@@ -240,9 +254,29 @@ export async function getSessions(limit = 50, offset = 0, sort: SessionSortMode 
   // Parse ALL files across ALL projects
   const allStats = await runInPool(allFiles.map(f => f.filePath));
   
-  const allSessions = allStats
+  let allSessions = allStats
     .map((stats, i) => statsToFileSession(stats, allFiles[i].projectId, allFiles[i].projectName))
     .filter(s => s.messageCount > 0);
+
+  // Apply filters
+  if (filters) {
+    if (filters.model && filters.model !== 'all') {
+      allSessions = allSessions.filter(s => s.models.includes(filters.model!) || s.model === filters.model);
+    }
+    if (filters.dateRange && filters.dateRange !== 'all') {
+      const now = new Date();
+      let days = 0;
+      if (filters.dateRange === 'w') days = 7;
+      else if (filters.dateRange === 'm') days = 30;
+      else if (filters.dateRange === 'q') days = 90;
+      else if (filters.dateRange === 'y') days = 365;
+      
+      if (days > 0) {
+        const cutoff = new Date(now.getTime() - days * 24 * 60 * 60 * 1000).toISOString();
+        allSessions = allSessions.filter(s => s.timestamp >= cutoff);
+      }
+    }
+  }
 
   allSessions.sort((a, b) => {
     switch (sort) {
