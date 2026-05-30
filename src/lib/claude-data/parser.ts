@@ -1,5 +1,3 @@
-'use server';
-
 import fs from 'fs';
 import readline from 'readline';
 import { calculateCostAllModes } from '@/config/pricing';

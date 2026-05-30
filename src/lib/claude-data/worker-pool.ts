@@ -1,5 +1,3 @@
-'use server';
-
 import { Worker } from 'worker_threads';
 import path from 'path';
 import os from 'os';
