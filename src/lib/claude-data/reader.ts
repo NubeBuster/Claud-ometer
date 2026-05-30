@@ -1,7 +1,6 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import readline from 'readline';
 import { calculateCostAllModes, getModelDisplayName, DEFAULT_COST_MODE } from '@/config/pricing';
 import { getActiveDataSource, getImportDir } from './data-source';
 import type {
@@ -14,34 +13,10 @@ import type {
   DashboardStats,
   DailyActivity,
   DailyModelTokens,
-  TokenUsage,
-  SessionMessage,
   CostEstimates,
 } from './types';
 
-function zeroCosts(): CostEstimates {
-  return { api: 0, conservative: 0, subscription: 0 };
-}
-
-function addCosts(a: CostEstimates, b: CostEstimates): CostEstimates {
-  return {
-    api: a.api + b.api,
-    conservative: a.conservative + b.conservative,
-    subscription: a.subscription + b.subscription,
-  };
-}
-
-async function forEachJsonlLine(filePath: string, callback: (msg: SessionMessage) => void): Promise<void> {
-  const fileStream = fs.createReadStream(filePath);
-  const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
-  for await (const line of rl) {
-    if (!line.trim()) continue;
-    try {
-      const msg = JSON.parse(line) as SessionMessage;
-      callback(msg);
-    } catch { /* skip malformed line */ }
-  }
-}
+import { parseFileStats, addCosts, zeroCosts, forEachJsonlLine, type FileStats } from './parser';
 
 function getClaudeDir(): string {
   if (getActiveDataSource() === 'imported') {
@@ -106,17 +81,64 @@ function getProjectNameFromDir(projectPath: string, projectId: string): { name: 
   return { name: projectIdToName(projectId), fullPath: projectIdToFullPath(projectId) };
 }
 
+// Simple concurrency limiter
+async function pLimit<T, R>(limit: number, items: T[], fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: Promise<R>[] = [];
+  const executing: Promise<void>[] = [];
+  for (const item of items) {
+    const p = Promise.resolve().then(() => fn(item));
+    results.push(p);
+    if (limit <= items.length) {
+      const e: Promise<void> = p.then(() => {
+        executing.splice(executing.indexOf(e), 1);
+      });
+      executing.push(e);
+      if (executing.length >= limit) {
+        await Promise.race(executing);
+      }
+    }
+  }
+  return Promise.all(results);
+}
+
+import { runInPool } from './worker-pool';
+
 export async function getProjects(): Promise<ProjectInfo[]> {
-  if (!fs.existsSync(getProjectsDir())) return [];
-  const entries = fs.readdirSync(getProjectsDir());
-  const projects: ProjectInfo[] = [];
+  const projectsDir = getProjectsDir();
+  if (!fs.existsSync(projectsDir)) return [];
+  
+  const entries = fs.readdirSync(projectsDir);
+  const projectPaths = entries
+    .map(entry => path.join(projectsDir, entry))
+    .filter(p => {
+      try { return fs.statSync(p).isDirectory(); } catch { return false; }
+    });
 
-  for (const entry of entries) {
-    const projectPath = path.join(getProjectsDir(), entry);
-    if (!fs.statSync(projectPath).isDirectory()) continue;
-
+  const allFiles: { filePath: string; projectId: string }[] = [];
+  for (const projectPath of projectPaths) {
+    const entry = path.basename(projectPath);
     const jsonlFiles = fs.readdirSync(projectPath).filter(f => f.endsWith('.jsonl'));
-    if (jsonlFiles.length === 0) continue;
+    for (const file of jsonlFiles) {
+      allFiles.push({ filePath: path.join(projectPath, file), projectId: entry });
+    }
+  }
+
+  // Parse ALL files across ALL projects in one big pool run
+  const allStats = await runInPool(allFiles.map(f => f.filePath));
+  
+  // Group stats back by project
+  const statsByProject: Record<string, typeof allStats> = {};
+  for (let i = 0; i < allFiles.length; i++) {
+    const projectId = allFiles[i].projectId;
+    if (!statsByProject[projectId]) statsByProject[projectId] = [];
+    statsByProject[projectId].push(allStats[i]);
+  }
+
+  const projects: ProjectInfo[] = [];
+  for (const projectPath of projectPaths) {
+    const entry = path.basename(projectPath);
+    const fileStats = statsByProject[entry] || [];
+    if (fileStats.length === 0) continue;
 
     let totalMessages = 0;
     let totalTokens = 0;
@@ -124,36 +146,27 @@ export async function getProjects(): Promise<ProjectInfo[]> {
     let lastActive = '';
     const modelsSet = new Set<string>();
 
-    for (const file of jsonlFiles) {
-      const filePath = path.join(projectPath, file);
-      const stat = fs.statSync(filePath);
-      const mtime = stat.mtime.toISOString();
-      if (!lastActive || mtime > lastActive) lastActive = mtime;
-
-      await forEachJsonlLine(filePath, (msg) => {
-        if (msg.type === 'user') totalMessages++;
-        if (msg.type === 'assistant') {
-          totalMessages++;
-          const model = msg.message?.model || '';
-          if (model) modelsSet.add(model);
-          const usage = msg.message?.usage;
-          if (usage) {
-            const tokens = (usage.input_tokens || 0) + (usage.output_tokens || 0) +
-              (usage.cache_read_input_tokens || 0) + (usage.cache_creation_input_tokens || 0);
-            totalTokens += tokens;
-            const costs = calculateCostAllModes(
-              model,
-              usage.input_tokens || 0,
-              usage.output_tokens || 0,
-              usage.cache_creation_input_tokens || 0,
-              usage.cache_read_input_tokens || 0
-            );
-            estimatedCosts = addCosts(estimatedCosts, costs);
-          }
-        }
-      });
+    for (const stats of fileStats) {
+      totalMessages += stats.userMessageCount + stats.assistantMessageCount;
+      totalTokens += stats.totalInputTokens + stats.totalOutputTokens + stats.totalCacheReadTokens + stats.totalCacheWriteTokens;
+      estimatedCosts = addCosts(estimatedCosts, stats.estimatedCosts);
+      
+      const mtime = stats.lastTimestamp;
+      if (mtime && (!lastActive || mtime > lastActive)) lastActive = mtime;
+      
+      for (const model of stats.models) modelsSet.add(model);
     }
 
+    // If no message timestamps, fallback to fs mtime
+    if (!lastActive) {
+      try {
+        lastActive = fs.statSync(projectPath).mtime.toISOString();
+      } catch {
+        lastActive = new Date().toISOString();
+      }
+    }
+
+    const jsonlFiles = fs.readdirSync(projectPath).filter(f => f.endsWith('.jsonl'));
     const firstSessionPath = path.join(projectPath, jsonlFiles[0]);
     const cwd = extractCwdFromSession(firstSessionPath);
 
@@ -180,151 +193,112 @@ export async function getProjectSessions(projectId: string): Promise<SessionInfo
 
   const { name: projectName } = getProjectNameFromDir(projectPath, projectId);
   const jsonlFiles = fs.readdirSync(projectPath).filter(f => f.endsWith('.jsonl'));
-  const sessions: SessionInfo[] = [];
-  for (const file of jsonlFiles) {
-    sessions.push(await parseSessionFile(path.join(projectPath, file), projectId, projectName));
-  }
+  const filePaths = jsonlFiles.map(file => path.join(projectPath, file));
+  
+  const allStats = await runInPool(filePaths);
+  
+  const sessions = allStats.map(stats => statsToFileSession(stats, projectId, projectName));
   return sessions.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
 }
 
 export async function getSessions(limit = 50, offset = 0): Promise<SessionInfo[]> {
-  const allSessions: SessionInfo[] = [];
+  const projectsDir = getProjectsDir();
+  if (!fs.existsSync(projectsDir)) return [];
+  const projectEntries = fs.readdirSync(projectsDir);
 
-  if (!fs.existsSync(getProjectsDir())) return [];
-  const projectEntries = fs.readdirSync(getProjectsDir());
-
+  const allFiles: { filePath: string; projectId: string; projectName: string }[] = [];
   for (const entry of projectEntries) {
-    const projectPath = path.join(getProjectsDir(), entry);
+    const projectPath = path.join(projectsDir, entry);
     if (!fs.statSync(projectPath).isDirectory()) continue;
 
     const { name: projectName } = getProjectNameFromDir(projectPath, entry);
     const jsonlFiles = fs.readdirSync(projectPath).filter(f => f.endsWith('.jsonl'));
     for (const file of jsonlFiles) {
-      allSessions.push(await parseSessionFile(path.join(projectPath, file), entry, projectName));
+      allFiles.push({ filePath: path.join(projectPath, file), projectId: entry, projectName });
     }
   }
+
+  // Parse ALL files across ALL projects
+  const allStats = await runInPool(allFiles.map(f => f.filePath));
+  
+  const allSessions = allStats.map((stats, i) => 
+    statsToFileSession(stats, allFiles[i].projectId, allFiles[i].projectName)
+  );
 
   allSessions.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
   return allSessions.slice(offset, offset + limit);
 }
 
-async function parseSessionFile(filePath: string, projectId: string, projectName: string): Promise<SessionInfo> {
-  const sessionId = path.basename(filePath, '.jsonl');
-
-  let firstTimestamp = '';
-  let lastTimestamp = '';
-  let userMessageCount = 0;
-  let assistantMessageCount = 0;
-  let toolCallCount = 0;
-  let totalInputTokens = 0;
-  let totalOutputTokens = 0;
-  let totalCacheReadTokens = 0;
-  let totalCacheWriteTokens = 0;
-  let estimatedCosts = zeroCosts();
-  let gitBranch = '';
-  let cwd = '';
-  let version = '';
-  const modelsSet = new Set<string>();
-  const toolsUsed: Record<string, number> = {};
-
-  // Compaction tracking
-  let compactions = 0;
-  let microcompactions = 0;
-  let totalTokensSaved = 0;
-  const compactionTimestamps: string[] = [];
-
-  await forEachJsonlLine(filePath, (msg) => {
-    if (msg.timestamp) {
-      if (!firstTimestamp) firstTimestamp = msg.timestamp;
-      lastTimestamp = msg.timestamp;
-    }
-    if (msg.gitBranch && !gitBranch) gitBranch = msg.gitBranch;
-    if (msg.cwd && !cwd) cwd = msg.cwd;
-    if (msg.version && !version) version = msg.version;
-
-    // Track compaction events
-    if (msg.compactMetadata) {
-      compactions++;
-      if (msg.timestamp) compactionTimestamps.push(msg.timestamp);
-    }
-    if (msg.microcompactMetadata) {
-      microcompactions++;
-      totalTokensSaved += msg.microcompactMetadata.tokensSaved || 0;
-      if (msg.timestamp) compactionTimestamps.push(msg.timestamp);
-    }
-
-    if (msg.type === 'user') {
-      if (msg.message?.role === 'user' && typeof msg.message.content === 'string') {
-        userMessageCount++;
-      } else if (msg.message?.role === 'user') {
-        userMessageCount++;
-      }
-    }
-    if (msg.type === 'assistant') {
-      assistantMessageCount++;
-      const model = msg.message?.model || '';
-      if (model) modelsSet.add(model);
-      const usage = msg.message?.usage;
-      if (usage) {
-        totalInputTokens += usage.input_tokens || 0;
-        totalOutputTokens += usage.output_tokens || 0;
-        totalCacheReadTokens += usage.cache_read_input_tokens || 0;
-        totalCacheWriteTokens += usage.cache_creation_input_tokens || 0;
-        const costs = calculateCostAllModes(
-          model,
-          usage.input_tokens || 0,
-          usage.output_tokens || 0,
-          usage.cache_creation_input_tokens || 0,
-          usage.cache_read_input_tokens || 0
-        );
-        estimatedCosts = addCosts(estimatedCosts, costs);
-      }
-      const content = msg.message?.content;
-      if (Array.isArray(content)) {
-        for (const c of content) {
-          if (c && typeof c === 'object' && 'type' in c && c.type === 'tool_use') {
-            toolCallCount++;
-            const name = ('name' in c ? c.name : 'unknown') as string;
-            toolsUsed[name] = (toolsUsed[name] || 0) + 1;
-          }
-        }
-      }
-    }
-  });
-
-  const duration = firstTimestamp && lastTimestamp
-    ? new Date(lastTimestamp).getTime() - new Date(firstTimestamp).getTime()
+function statsToFileSession(stats: FileStats, projectId: string, projectName: string): SessionInfo {
+  const duration = stats.firstTimestamp && stats.lastTimestamp
+    ? new Date(stats.lastTimestamp).getTime() - new Date(stats.firstTimestamp).getTime()
     : 0;
 
-  const models = Array.from(modelsSet);
-
   return {
-    id: sessionId,
+    id: stats.sessionId,
     projectId,
     projectName,
-    timestamp: firstTimestamp || new Date().toISOString(),
+    timestamp: stats.firstTimestamp || new Date().toISOString(),
     duration,
-    messageCount: userMessageCount + assistantMessageCount,
-    userMessageCount,
-    assistantMessageCount,
-    toolCallCount,
-    totalInputTokens,
-    totalOutputTokens,
-    totalCacheReadTokens,
-    totalCacheWriteTokens,
-    estimatedCost: estimatedCosts[DEFAULT_COST_MODE],
-    estimatedCosts,
-    model: models[0] || 'unknown',
-    models: models.map(getModelDisplayName),
-    gitBranch,
-    cwd,
-    version,
-    toolsUsed,
+    messageCount: stats.userMessageCount + stats.assistantMessageCount,
+    userMessageCount: stats.userMessageCount,
+    assistantMessageCount: stats.assistantMessageCount,
+    toolCallCount: stats.toolCallCount,
+    totalInputTokens: stats.totalInputTokens,
+    totalOutputTokens: stats.totalOutputTokens,
+    totalCacheReadTokens: stats.totalCacheReadTokens,
+    totalCacheWriteTokens: stats.totalCacheWriteTokens,
+    estimatedCost: stats.estimatedCosts[DEFAULT_COST_MODE],
+    estimatedCosts: stats.estimatedCosts,
+    model: stats.models[0] || 'unknown',
+    models: stats.models.map(getModelDisplayName),
+    gitBranch: stats.gitBranch,
+    cwd: stats.cwd,
+    version: stats.version,
+    toolsUsed: stats.toolsUsed,
     compaction: {
-      compactions,
-      microcompactions,
-      totalTokensSaved,
-      compactionTimestamps,
+      compactions: stats.compactions,
+      microcompactions: stats.microcompactions,
+      totalTokensSaved: stats.totalTokensSaved,
+      compactionTimestamps: stats.compactionTimestamps,
+    },
+  };
+}
+
+async function parseSessionFile(filePath: string, projectId: string, projectName: string): Promise<SessionInfo> {
+  const stats = await parseFileStats(filePath);
+
+  const duration = stats.firstTimestamp && stats.lastTimestamp
+    ? new Date(stats.lastTimestamp).getTime() - new Date(stats.firstTimestamp).getTime()
+    : 0;
+
+  return {
+    id: stats.sessionId,
+    projectId,
+    projectName,
+    timestamp: stats.firstTimestamp || new Date().toISOString(),
+    duration,
+    messageCount: stats.userMessageCount + stats.assistantMessageCount,
+    userMessageCount: stats.userMessageCount,
+    assistantMessageCount: stats.assistantMessageCount,
+    toolCallCount: stats.toolCallCount,
+    totalInputTokens: stats.totalInputTokens,
+    totalOutputTokens: stats.totalOutputTokens,
+    totalCacheReadTokens: stats.totalCacheReadTokens,
+    totalCacheWriteTokens: stats.totalCacheWriteTokens,
+    estimatedCost: stats.estimatedCosts[DEFAULT_COST_MODE],
+    estimatedCosts: stats.estimatedCosts,
+    model: stats.models[0] || 'unknown',
+    models: stats.models.map(getModelDisplayName),
+    gitBranch: stats.gitBranch,
+    cwd: stats.cwd,
+    version: stats.version,
+    toolsUsed: stats.toolsUsed,
+    compaction: {
+      compactions: stats.compactions,
+      microcompactions: stats.microcompactions,
+      totalTokensSaved: stats.totalTokensSaved,
+      compactionTimestamps: stats.compactionTimestamps,
     },
   };
 }
@@ -344,65 +318,58 @@ export async function getSessionDetail(sessionId: string): Promise<SessionDetail
     const sessionInfo = await parseSessionFile(filePath, entry, projectName);
     const messages: SessionMessageDisplay[] = [];
 
-    const fileStream = fs.createReadStream(filePath);
-    const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
-
-    for await (const line of rl) {
-      if (!line.trim()) continue;
-      try {
-        const msg = JSON.parse(line) as SessionMessage;
-        if (msg.type === 'user' && msg.message?.role === 'user') {
-          const content = msg.message.content;
-          let text = '';
-          if (typeof content === 'string') {
-            text = content;
-          } else if (Array.isArray(content)) {
-            text = content
-              .map((c: Record<string, unknown>) => {
-                if (c.type === 'text') return c.text as string;
-                if (c.type === 'tool_result') return '[Tool Result]';
-                return '';
-              })
-              .filter(Boolean)
-              .join('\n');
-          }
-          if (text && !text.startsWith('[Tool Result]')) {
-            messages.push({
-              role: 'user',
-              content: text,
-              timestamp: msg.timestamp,
-            });
-          }
+    await forEachJsonlLine(filePath, (msg) => {
+      if (msg.type === 'user' && msg.message?.role === 'user') {
+        const content = msg.message.content;
+        let text = '';
+        if (typeof content === 'string') {
+          text = content;
+        } else if (Array.isArray(content)) {
+          text = content
+            .map((c: Record<string, unknown>) => {
+              if (c.type === 'text') return c.text as string;
+              if (c.type === 'tool_result') return '[Tool Result]';
+              return '';
+            })
+            .filter(Boolean)
+            .join('\n');
         }
-        if (msg.type === 'assistant' && msg.message?.content) {
-          const content = msg.message.content;
-          const toolCalls: { name: string; id: string }[] = [];
-          let text = '';
-          if (Array.isArray(content)) {
-            for (const c of content) {
-              if (c && typeof c === 'object') {
-                if ('type' in c && c.type === 'text' && 'text' in c) {
-                  text += (c.text as string) + '\n';
-                }
-                if ('type' in c && c.type === 'tool_use' && 'name' in c) {
-                  toolCalls.push({ name: c.name as string, id: (c.id as string) || '' });
-                }
+        if (text && !text.startsWith('[Tool Result]')) {
+          messages.push({
+            role: 'user',
+            content: text,
+            timestamp: msg.timestamp,
+          });
+        }
+      }
+      if (msg.type === 'assistant' && msg.message?.content) {
+        const content = msg.message.content;
+        const toolCalls: { name: string; id: string }[] = [];
+        let text = '';
+        if (Array.isArray(content)) {
+          for (const c of content) {
+            if (c && typeof c === 'object') {
+              if ('type' in c && c.type === 'text' && 'text' in c) {
+                text += (c.text as string) + '\n';
+              }
+              if ('type' in c && c.type === 'tool_use' && 'name' in c) {
+                toolCalls.push({ name: c.name as string, id: (c.id as string) || '' });
               }
             }
           }
-          if (text.trim() || toolCalls.length > 0) {
-            messages.push({
-              role: 'assistant',
-              content: text.trim() || `[Used ${toolCalls.length} tool(s): ${toolCalls.map(t => t.name).join(', ')}]`,
-              timestamp: msg.timestamp,
-              model: msg.message.model,
-              usage: msg.message.usage as TokenUsage | undefined,
-              toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
-            });
-          }
         }
-      } catch { /* skip */ }
-    }
+        if (text.trim() || toolCalls.length > 0) {
+          messages.push({
+            role: 'assistant',
+            content: text.trim() || `[Used ${toolCalls.length} tool(s): ${toolCalls.map(t => t.name).join(', ')}]`,
+            timestamp: msg.timestamp,
+            model: msg.message.model,
+            usage: msg.message.usage as TokenUsage | undefined,
+            toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+          });
+        }
+      }
+    });
 
     return { ...sessionInfo, messages };
   }
@@ -419,6 +386,8 @@ export async function searchSessions(query: string, limit = 50): Promise<Session
   if (!fs.existsSync(getProjectsDir())) return [];
   const projectEntries = fs.readdirSync(getProjectsDir());
 
+  const searchPromises: Promise<void>[] = [];
+
   for (const entry of projectEntries) {
     const projectPath = path.join(getProjectsDir(), entry);
     if (!fs.statSync(projectPath).isDirectory()) continue;
@@ -427,47 +396,51 @@ export async function searchSessions(query: string, limit = 50): Promise<Session
     for (const file of jsonlFiles) {
       const filePath = path.join(projectPath, file);
 
-      let hasMatch = false;
-      await forEachJsonlLine(filePath, (msg) => {
-        if (hasMatch) return;
-        if (msg.type === 'user' && msg.message?.role === 'user') {
-          const content = msg.message.content;
-          if (typeof content === 'string' && content.toLowerCase().includes(lowerQuery)) {
-            hasMatch = true;
-            return;
-          }
-          if (Array.isArray(content)) {
-            for (const c of content) {
-              if (c && typeof c === 'object' && 'type' in c && c.type === 'text' && 'text' in c) {
-                if ((c.text as string).toLowerCase().includes(lowerQuery)) {
-                  hasMatch = true;
-                  return;
+      searchPromises.push((async () => {
+        let hasMatch = false;
+        await forEachJsonlLine(filePath, (msg) => {
+          if (hasMatch) return;
+          if (msg.type === 'user' && msg.message?.role === 'user') {
+            const content = msg.message.content;
+            if (typeof content === 'string' && content.toLowerCase().includes(lowerQuery)) {
+              hasMatch = true;
+              return;
+            }
+            if (Array.isArray(content)) {
+              for (const c of content) {
+                if (c && typeof c === 'object' && 'type' in c && c.type === 'text' && 'text' in c) {
+                  if ((c.text as string).toLowerCase().includes(lowerQuery)) {
+                    hasMatch = true;
+                    return;
+                  }
                 }
               }
             }
           }
-        }
-        if (msg.type === 'assistant' && msg.message?.content) {
-          const content = msg.message.content;
-          if (Array.isArray(content)) {
-            for (const c of content) {
-              if (c && typeof c === 'object' && 'type' in c && c.type === 'text' && 'text' in c) {
-                if ((c.text as string).toLowerCase().includes(lowerQuery)) {
-                  hasMatch = true;
-                  return;
+          if (msg.type === 'assistant' && msg.message?.content) {
+            const content = msg.message.content;
+            if (Array.isArray(content)) {
+              for (const c of content) {
+                if (c && typeof c === 'object' && 'type' in c && c.type === 'text' && 'text' in c) {
+                  if ((c.text as string).toLowerCase().includes(lowerQuery)) {
+                    hasMatch = true;
+                    return;
+                  }
                 }
               }
             }
           }
-        }
-      });
+        });
 
-      if (hasMatch) {
-        const { name: projectName } = getProjectNameFromDir(projectPath, entry);
-        matchingSessions.push(await parseSessionFile(filePath, entry, projectName));
-      }
+        if (hasMatch) {
+          const { name: projectName } = getProjectNameFromDir(projectPath, entry);
+          matchingSessions.push(await parseSessionFile(filePath, entry, projectName));
+        }
+      })());
     }
   }
+
+  await Promise.all(searchPromises);
 
   matchingSessions.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
   return matchingSessions.slice(0, limit);
@@ -537,7 +510,7 @@ async function computeSupplementalStats(afterDate: string): Promise<Supplemental
   let totalTokens = 0;
   let estimatedCosts = zeroCosts();
 
-  for (const filePath of files) {
+  await pLimit(100, files, async (filePath) => {
     let firstTimestamp = '';
     let sessionCounted = false;
     let firstQualifyingDate = '';
@@ -643,7 +616,7 @@ async function computeSupplementalStats(afterDate: string): Promise<Supplemental
       const day = dailyMap.get(firstQualifyingDate);
       if (day) day.sessionCount++;
     }
-  }
+  });
 
   const dailyActivity = Array.from(dailyMap.values()).sort((a, b) => a.date.localeCompare(b.date));
   const dailyModelTokens: DailyModelTokens[] = Array.from(dailyModelMap.entries())
@@ -750,9 +723,9 @@ export async function getDashboardStats(): Promise<DashboardStats> {
     const totalTok = usage.inputTokens + usage.outputTokens + usage.cacheReadInputTokens + usage.cacheCreationInputTokens;
     if (totalTok > 0 && usage.estimatedCosts) {
       modelCostPerToken[model] = {
-        api: usage.estimatedCosts.api / totalTok,
-        conservative: usage.estimatedCosts.conservative / totalTok,
-        subscription: usage.estimatedCosts.subscription / totalTok,
+        api: usage.estimatedCosts.api / (totalTok || 1),
+        conservative: usage.estimatedCosts.conservative / (totalTok || 1),
+        subscription: usage.estimatedCosts.subscription / (totalTok || 1),
       };
     }
   }
